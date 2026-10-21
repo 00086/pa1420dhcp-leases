@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PA-1420 DHCP 智能監控系統</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css">
+    <style>
+        body { background-color: #f4f6f9; height: 100vh; overflow: hidden; }
+        
+        .upload-card {
+            background-color: #ffffff;
+            border-radius: 8px;
+            padding: 12px 15px;
+        }
+        
+        .upload-zone {
+            border: 2px dashed #0d6efd; 
+            border-radius: 6px; 
+            padding: 12px;
+            text-align: center; 
+            background-color: #f8fbff; 
+            cursor: pointer; 
+            transition: 0.25s;
+        }
+        .upload-zone:hover, .upload-zone.dragover { 
+            background-color: #e2edff; 
+            border-color: #0a58ca; 
+        }
+        
+        /* 固定表頭樣式 */
+        .table-sticky-header th {
+            position: sticky; 
+            top: 0; 
+            background-color: #f8f9fa; 
+            z-index: 2;
+            box-shadow: 0 2px 2px -1px rgba(0,0,0,0.1);
+            white-space: nowrap;
+        }
+        
+        /* 捲動容器：改為 overflow-y: scroll 常駐右側捲軸軌道，避免無資料與有資料切換時產生 15px 水平位移 */
+        .table-scroll-container { 
+            overflow-y: scroll; 
+            flex-grow: 1; 
+        }
+
+        /* 鎖死表格佈局，禁止根據內容變動寬度 */
+        .table-fixed {
+            table-layout: fixed;
+            width: 100%;
+            margin-bottom: 0;
+        }
+
+        .table-fixed th, .table-fixed td {
+            vertical-align: middle;
+            text-overflow: ellipsis;
+            overflow: hidden;
+            white-space: nowrap;
+        }
+    </style>
+</head>
+<body class="d-flex flex-column">
+
+<div class="container-fluid d-flex flex-column h-100 p-3">
+    
+    <!-- 頂部操作列 -->
+    <div class="row mb-3 flex-shrink-0">
+        <!-- 上傳區塊 (指定匯入日期) -->
+        <div class="col-md-5">
+            <div class="card shadow-sm h-100 upload-card d-flex flex-column justify-content-between">
+                <div class="d-flex align-items-center gap-2 mb-2">
+                    <label for="upload-date" class="form-label mb-0 small fw-bold text-nowrap">
+                        <i class="bi bi-calendar-event text-primary"></i> 指定匯入日期：
+                    </label>
+                    <input type="date" id="upload-date" class="form-control form-control-sm font-monospace">
+                </div>
+
+                <div id="drop-zone" class="upload-zone flex-grow-1 d-flex flex-column justify-content-center">
+                    <div class="fw-bold text-primary small">
+                        <i class="bi bi-cloud-arrow-up-fill fs-5 me-1"></i> 點擊選取或拖曳 XML 至此
+                    </div>
+                    <span class="text-muted" style="font-size: 11px;">(將歸入上方選定之日期)</span>
+                    <input type="file" id="file-input" accept=".xml" style="display: none;">
+                </div>
+            </div>
+        </div>
+
+        <!-- 防火牆排程狀態與即時抓取 -->
+        <div class="col-md-7">
+            <div class="card shadow-sm h-100">
+                <div class="card-body d-flex justify-content-between align-items-center py-2" id="status-panel">
+                    <div>
+                        <span class="badge bg-success mb-1">自動排程運作中 (4 次/日)</span>
+                        <div class="small text-muted">固定於每日 <strong>01:00、07:00、15:00、23:00</strong> 自動抓取</div>
+                    </div>
+                    <button class="btn btn-outline-primary btn-sm" onclick="fetchNow()">
+                        <i class="bi bi-arrow-repeat"></i> 立即從 PA-1420 抓取
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 租約清單資料面板 -->
+    <div class="row flex-grow-1 overflow-hidden">
+        <div class="col-12 h-100">
+            <div class="card shadow-sm h-100 d-flex flex-column">
+                
+                <!-- 工具列：檢視日期日曆輸入框 -->
+                <div class="card-header bg-white py-2 d-flex justify-content-between align-items-center flex-shrink-0">
+                    <div class="d-flex align-items-center gap-2">
+                        <h5 class="mb-0 fw-bold"><i class="bi bi-shield-check text-primary"></i> 租約清單</h5>
+                        
+                        <div class="input-group input-group-sm ms-3" style="width: 250px;">
+                            <label class="input-group-text"><i class="bi bi-calendar3"></i> 檢視日期</label>
+                            <input type="date" class="form-control font-monospace" id="view-date" onchange="changeDate(this.value)">
+                        </div>
+                    </div>
+                    <span class="badge bg-primary rounded-pill" id="total-records-badge">共 0 筆</span>
+                </div>
+                
+                <!-- 內部固定捲動表格 -->
+                <div class="card-body p-0 table-scroll-container">
+                    <table class="table table-hover table-striped table-sticky-header table-fixed">
+                        <!-- 透過 colgroup 嚴格鎖定 6 個欄位的寬度百分比，任何情況絕不位移 -->
+                        <colgroup>
+                            <col style="width: 15%;">  <!-- IP 位址 -->
+                            <col style="width: 18%;">  <!-- MAC 位址 -->
+                            <col style="width: 25%;">  <!-- Hostname -->
+                            <col style="width: 10%;">  <!-- State -->
+                            <col style="width: 10%;">  <!-- Duration -->
+                            <col style="width: 22%;">  <!-- Lease Time -->
+                        </colgroup>
+                        <thead>
+                            <tr>
+                                <th>IP 位址</th>
+                                <th>MAC 位址</th>
+                                <th>Hostname</th>
+                                <th>State</th>
+                                <th>Duration</th>
+                                <th>Lease Time</th>
+                            </tr>
+                        </thead>
+                        <tbody id="table-body"></tbody>
+                    </table>
+                </div>
+
+                <!-- 分頁列 -->
+                <div class="card-footer bg-white flex-shrink-0 d-flex justify-content-end py-2">
+                    <nav>
+                        <ul class="pagination pagination-sm mb-0" id="pagination-ul"></ul>
+                    </nav>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    const todayStr = new Date().toISOString().split('T')[0];
+    let currentDate = todayStr;
+    let currentPage = 1;
+
+    document.getElementById('upload-date').value = todayStr;
+    document.getElementById('view-date').value = todayStr;
+
+    function fetchNow() {
+        const panel = document.getElementById('status-panel');
+        panel.innerHTML = `<div class="d-flex align-items-center"><div class="spinner-border spinner-border-sm text-primary me-2"></div> 連線 PA-1420 抓取中...</div>`;
+        
+        fetch('/api/fetch-now', { method: 'POST' })
+            .then(res => res.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    panel.innerHTML = `<div><span class="text-success fw-bold"><i class="bi bi-check-circle"></i> 抓取成功！</span> 新增：${data.success_count} 筆，略過重複：${data.duplicate_count} 筆</div>
+                                       <button class="btn btn-outline-primary btn-sm" onclick="fetchNow()"><i class="bi bi-arrow-repeat"></i> 再次更新</button>`;
+                    document.getElementById('view-date').value = data.date;
+                    loadData(1, data.date);
+                } else {
+                    panel.innerHTML = `<div><span class="text-danger fw-bold"><i class="bi bi-exclamation-triangle"></i> 錯誤：</span> ${data.message}</div>
+                                       <button class="btn btn-outline-primary btn-sm" onclick="fetchNow()"><i class="bi bi-arrow-repeat"></i> 重試</button>`;
+                }
+            });
+    }
+
+    function loadData(page, date = currentDate) {
+        currentPage = page;
+        currentDate = date;
+
+        fetch(`/api/leases?page=${page}&per_page=50&date=${date}`)
+            .then(res => res.json())
+            .then(data => {
+                renderTable(data.data);
+                renderPagination(data.current_page, data.total_pages);
+                document.getElementById('total-records-badge').innerText = `共 ${data.total_records} 筆`;
+            });
+    }
+
+    function changeDate(newDate) {
+        if (!newDate) return;
+        loadData(1, newDate);
+    }
+
+    function renderTable(data) {
+        const tbody = document.getElementById('table-body');
+        tbody.innerHTML = '';
+        if (!data || data.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted py-5"><i class="bi bi-inbox fs-3 d-block mb-2"></i>該日期查無租約紀錄</td></tr>';
+            return;
+        }
+        data.forEach(row => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+                <td class="font-monospace text-primary fw-bold">${row.ip}</td>
+                <td class="font-monospace">${row.mac}</td>
+                <td title="${row.hostname || ''}">${row.hostname || '<span class="text-muted">-</span>'}</td>
+                <td><span class="badge bg-secondary">${row.state}</span></td>
+                <td>${row.duration}</td>
+                <td><small>${row.leasetime}</small></td>
+            `;
+            tbody.appendChild(tr);
+        });
+    }
+
+    function renderPagination(current, total) {
+        const ul = document.getElementById('pagination-ul');
+        ul.innerHTML = '';
+        if (!total || total <= 1) return;
+
+        const maxVisible = 10;
+        let startPage = Math.max(1, current - Math.floor(maxVisible / 2));
+        let endPage = startPage + maxVisible - 1;
+        if (endPage > total) {
+            endPage = total;
+            startPage = Math.max(1, endPage - maxVisible + 1);
+        }
+
+        ul.innerHTML += `<li class="page-item ${current === 1 ? 'disabled' : ''}"><a class="page-link" href="#" onclick="loadData(1, '${currentDate}'); return false;"><i class="bi bi-chevron-double-left"></i></a></li>`;
+        ul.innerHTML += `<li class="page-item ${current === 1 ? 'disabled' : ''}"><a class="page-link" href="#" onclick="loadData(${current - 1}, '${currentDate}'); return false;"><i class="bi bi-chevron-left"></i></a></li>`;
+
+        for (let i = startPage; i <= endPage; i++) {
+            ul.innerHTML += `<li class="page-item ${i === current ? 'active' : ''}"><a class="page-link" href="#" onclick="loadData(${i}, '${currentDate}'); return false;">${i}</a></li>`;
+        }
+
+        ul.innerHTML += `<li class="page-item ${current === total ? 'disabled' : ''}"><a class="page-link" href="#" onclick="loadData(${current + 1}, '${currentDate}'); return false;"><i class="bi bi-chevron-right"></i></a></li>`;
+        ul.innerHTML += `<li class="page-item ${current === total ? 'disabled' : ''}"><a class="page-link" href="#" onclick="loadData(${total}, '${currentDate}'); return false;"><i class="bi bi-chevron-double-right"></i></a></li>`;
+    }
+
+    const dropZone = document.getElementById('drop-zone');
+    const fileInput = document.getElementById('file-input');
+    dropZone.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', (e) => { if (e.target.files.length > 0) uploadFile(e.target.files[0]); });
+    
+    dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('dragover'); });
+    dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+    dropZone.addEventListener('drop', (e) => {
+        e.preventDefault(); 
+        dropZone.classList.remove('dragover');
+        if (e.dataTransfer.files.length > 0) uploadFile(e.dataTransfer.files[0]);
+    });
+
+    function uploadFile(file) {
+        if (!file.name.toLowerCase().endsWith('.xml')) {
+            alert('請選擇或拖曳 .xml 格式檔案！');
+            return;
+        }
+
+        const selectedDate = document.getElementById('upload-date').value || todayStr;
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('record_date', selectedDate);
+
+        fetch('/upload', { method: 'POST', body: formData })
+            .then(res => res.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    alert(`✅ ${data.message}\n✨ 成功新增：${data.success_count} 筆\n🔁 略過重複：${data.duplicate_count} 筆`);
+                    document.getElementById('view-date').value = data.record_date;
+                    loadData(1, data.record_date);
+                } else {
+                    alert(`❌ 匯入失敗：\n${data.message}`);
+                }
+            })
+            .catch(err => alert(`❌ 傳輸異常：${err}`))
+            .finally(() => { fileInput.value = ''; });
+    }
+
+    document.addEventListener('DOMContentLoaded', () => loadData(1));
+</script>
+</body>
+</html>
