@@ -57,7 +57,7 @@ dhcpxml/
 
 ```text
 192.168.1.1
-ethernet1/16
+ethernet1/1
 LUFRPT14MW55QW...（您的 PA-1420 API Key）...==
 
 ```
