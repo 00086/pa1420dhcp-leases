@@ -7,6 +7,7 @@ import datetime
 import xml.etree.ElementTree as ET
 import requests
 import urllib3
+import time
 from flask import Flask, render_template, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -147,13 +148,28 @@ def parse_and_insert_xml(xml_bytes, record_date=None):
     conn.commit()
     conn.close()
     return success_count, duplicate_count, multi_lease_count # 👈 記得回傳新計數器
+
+# -------------------------------------------------------------
+# 狀態追蹤 (用於讓前端網頁知道排程最新狀態)
+# -------------------------------------------------------------
+last_job_info = {
+    "timestamp": 0,
+    "type": "system",
+    "status": "waiting",
+    "message": "等待排程或手動更新...",
+    "success_count": 0,
+    "duplicate_count": 0,
+    "multi_lease_count": 0,
+    "date": ""
+}
     
 # -------------------------------------------------------------
-# PA-1420 API 抓取作業
+# PA-1420 API 抓取作業 (加入 job_type 與全域狀態更新)
 # -------------------------------------------------------------
-def fetch_pa_dhcp_job():
+def fetch_pa_dhcp_job(job_type="auto"):
+    global last_job_info
     today_str = datetime.date.today().isoformat()
-    print(f"\n[{datetime.datetime.now()}] 啟動 PA-1420 DHCP 抓取作業...")
+    print(f"\n[{datetime.datetime.now()}] 啟動 PA-1420 DHCP 抓取作業 ({job_type})...")
 
     try:
         fw_ip, interface, api_key, cmd = get_pa_config()
@@ -163,22 +179,34 @@ def fetch_pa_dhcp_job():
         response = requests.get(api_url, params=params, verify=False, timeout=30)
         response.raise_for_status()
 
-        # 👈 接收 multi_lease_count
         success, duplicate, multi_lease = parse_and_insert_xml(response.content, record_date=today_str)
         print(f"[{datetime.datetime.now()}] PA-1420 抓取完成！新增：{success} 筆(含多重租約 {multi_lease} 筆)，略過重複：{duplicate} 筆")
-        return {
+        
+        result = {
+            "timestamp": time.time(),
+            "type": job_type,       # 標記是 auto 還是 manual
             "status": "success", 
             "success_count": success, 
             "duplicate_count": duplicate, 
-            "multi_lease_count": multi_lease, # 👈 將資料回傳給前端
+            "multi_lease_count": multi_lease,
             "date": today_str,
             "fw_ip": fw_ip,
             "interface": interface
         }
+        last_job_info = result      # 👈 寫入全域狀態供前端抓取
+        return result
+
     except Exception as e:
         print(f"[{datetime.datetime.now()}] PA-1420 抓取失敗：{str(e)}")
-        return {"status": "error", "message": str(e)}
-        
+        result = {
+            "timestamp": time.time(),
+            "type": job_type,
+            "status": "error",
+            "message": str(e)
+        }
+        last_job_info = result      # 👈 寫入全域錯誤狀態
+        return result
+
 # -------------------------------------------------------------
 # Web 路由
 # -------------------------------------------------------------
@@ -188,8 +216,14 @@ def index():
 
 @app.route('/api/fetch-now', methods=['POST'])
 def trigger_fetch_now():
-    result = fetch_pa_dhcp_job()
+    # 標記為手動抓取
+    result = fetch_pa_dhcp_job(job_type="manual")
     return jsonify(result)
+
+# 👈 新增：提供前端輪詢最新狀態的 API
+@app.route('/api/latest-status', methods=['GET'])
+def get_latest_status():
+    return jsonify(last_job_info)
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
@@ -265,10 +299,11 @@ def get_leases():
     })
     
 # -------------------------------------------------------------
-# 定時排程器：每日 01:00、07:00、15:00、23:00 自動執行
+# 定時排程器：每日 01:00、05:00、09:00、13:00、17:00、21:00 自動執行
 # -------------------------------------------------------------
 scheduler = BackgroundScheduler(timezone="Asia/Taipei")
-scheduler.add_job(fetch_pa_dhcp_job, trigger='cron', hour='1,7,15,23', minute=0)
+# 👈 修改為 args=['auto'] 並更新時間頻率
+scheduler.add_job(fetch_pa_dhcp_job, args=['auto'], trigger='cron', hour='1,5,9,13,17,21', minute=0)
 scheduler.start()
 
 if __name__ == '__main__':

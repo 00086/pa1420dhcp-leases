@@ -91,8 +91,8 @@
             <div class="card shadow-sm h-100">
                 <div class="card-body d-flex justify-content-between align-items-center py-2" id="status-panel">
                     <div>
-                        <span class="badge bg-success mb-1">自動排程運作中 (4 次/日)</span>
-                        <div class="small text-muted">固定於每日 <strong>01:00、07:00、15:00、23:00</strong> 自動抓取</div>
+                        <span class="badge bg-secondary mb-1">系統監控中 (6 次/日)</span>
+                        <div class="small text-muted">自動排程：每日 <strong>01:00、05:00、09:00、13:00、17:00、21:00</strong></div>
                     </div>
                     <button class="btn btn-outline-primary btn-sm" onclick="fetchNow()">
                         <i class="bi bi-arrow-repeat"></i> 立即從 PA-1420 抓取
@@ -165,6 +165,38 @@
     document.getElementById('upload-date').value = todayStr;
     document.getElementById('view-date').value = todayStr;
 
+    let lastSeenTimestamp = 0; // 記錄前端最後一次看到的狀態時間
+
+    // 共用的狀態面板更新函數
+    function updateStatusPanel(data) {
+        const panel = document.getElementById('status-panel');
+        let multiMsg = data.multi_lease_count > 0 ? ` <span class="badge bg-warning text-dark ms-1">同 IP 多重租約：${data.multi_lease_count} 筆</span>` : "";
+        let timeString = new Date(data.timestamp * 1000).toLocaleTimeString('zh-TW', {hour12: false});
+        
+        let titleBadge = "";
+        if (data.type === 'auto') {
+            titleBadge = '<span class="badge bg-info text-dark mb-1"><i class="bi bi-robot"></i> 自動排程擷取完成</span>';
+        } else {
+            titleBadge = '<span class="badge bg-success mb-1"><i class="bi bi-person-check"></i> 手動抓取完成</span>';
+        }
+
+        if (data.status === 'success') {
+            panel.innerHTML = `<div>
+                                   ${titleBadge} <span class="text-muted small ms-2"><i class="bi bi-clock"></i> ${timeString}</span>
+                                   <div class="small fw-bold text-success mt-1">新增：${data.success_count} 筆${multiMsg}，略過重複：${data.duplicate_count} 筆</div>
+                               </div>
+                               <button class="btn btn-outline-primary btn-sm" onclick="fetchNow()"><i class="bi bi-arrow-repeat"></i> 再次更新</button>`;
+        } else if (data.status === 'error') {
+            titleBadge = data.type === 'auto' ? '<span class="badge bg-danger mb-1"><i class="bi bi-robot"></i> 自動排程失敗</span>' : '<span class="badge bg-danger mb-1"><i class="bi bi-person-x"></i> 手動抓取失敗</span>';
+            panel.innerHTML = `<div>
+                                   ${titleBadge} <span class="text-muted small ms-2"><i class="bi bi-clock"></i> ${timeString}</span>
+                                   <div class="small text-danger fw-bold mt-1"><i class="bi bi-exclamation-triangle"></i> 錯誤：${data.message}</div>
+                               </div>
+                               <button class="btn btn-outline-primary btn-sm" onclick="fetchNow()"><i class="bi bi-arrow-repeat"></i> 重試</button>`;
+        }
+    }
+
+    // 1. 手動觸發
     function fetchNow() {
         const panel = document.getElementById('status-panel');
         panel.innerHTML = `<div class="d-flex align-items-center"><div class="spinner-border spinner-border-sm text-primary me-2"></div> 連線 PA-1420 抓取中...</div>`;
@@ -172,20 +204,41 @@
         fetch('/api/fetch-now', { method: 'POST' })
             .then(res => res.json())
             .then(data => {
+                lastSeenTimestamp = data.timestamp; // 同步時間避免被輪詢機制重複觸發
+                updateStatusPanel(data);
                 if (data.status === 'success') {
-                    // 👈 新增多重租約的文字標示
-                    let multiMsg = data.multi_lease_count > 0 ? ` <span class="badge bg-warning text-dark ms-1">同 IP 多重租約：${data.multi_lease_count} 筆</span>` : "";
-                    
-                    panel.innerHTML = `<div><span class="text-success fw-bold"><i class="bi bi-check-circle"></i> 抓取成功！</span> 新增：${data.success_count} 筆${multiMsg}，略過重複：${data.duplicate_count} 筆</div>
-                                       <button class="btn btn-outline-primary btn-sm" onclick="fetchNow()"><i class="bi bi-arrow-repeat"></i> 再次更新</button>`;
                     document.getElementById('view-date').value = data.date;
                     loadData(1, data.date);
-                } else {
-                    panel.innerHTML = `<div><span class="text-danger fw-bold"><i class="bi bi-exclamation-triangle"></i> 錯誤：</span> ${data.message}</div>
-                                       <button class="btn btn-outline-primary btn-sm" onclick="fetchNow()"><i class="bi bi-arrow-repeat"></i> 重試</button>`;
                 }
             });
     }
+
+    // 2. 自動排程狀態輪詢 (每 10 秒檢查一次)
+    function checkAutoUpdate() {
+        fetch('/api/latest-status')
+            .then(res => res.json())
+            .then(data => {
+                // 如果後端有新進度，且時間戳記比前端記錄的還新
+                if (data.timestamp > lastSeenTimestamp) {
+                    lastSeenTimestamp = data.timestamp;
+                    
+                    if (data.status === 'waiting') return; // 初始狀態不動作
+
+                    // 更新右上角訊息
+                    updateStatusPanel(data);
+
+                    // 若目前選定的檢視日期，正好與自動排程抓取的日期相同，就立刻刷新表格資料
+                    const currentViewDate = document.getElementById('view-date').value;
+                    if (data.status === 'success' && data.date === currentViewDate) {
+                        loadData(currentPage, data.date);
+                    }
+                }
+            })
+            .catch(err => console.log("排程狀態檢查異常", err));
+    }
+
+    // 啟動 10 秒輪詢計時器
+    setInterval(checkAutoUpdate, 10000);
 
     function loadData(page, date = currentDate) {
         currentPage = page;
