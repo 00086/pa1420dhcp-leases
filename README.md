@@ -56,7 +56,7 @@ dhcpxml/
 在專案根目錄下建立 `pa1420key.txt`，依序填入三行內容：
 
 ```text
-192.50.1.1
+192.168.1.1
 ethernet1/16
 LUFRPT14MW55QW...（您的 PA-1420 API Key）...==
 
