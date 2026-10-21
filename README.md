@@ -4,6 +4,9 @@
 
 ---
 
+<img width="1890" height="142" alt="image" src="https://github.com/user-attachments/assets/baa5505f-7c6f-41e7-a5ac-43ae8f8d9fbe" />
+
+
 ## 🌟 系統功能特性
 
 1. **PA-1420 API 自動定時擷取**
