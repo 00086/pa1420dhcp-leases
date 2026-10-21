@@ -4,7 +4,7 @@
 
 ---
 
-<img width="1890" height="142" alt="image" src="https://github.com/user-attachments/assets/baa5505f-7c6f-41e7-a5ac-43ae8f8d9fbe" />
+<img width="1881" height="665" alt="image" src="https://github.com/user-attachments/assets/e21a5d90-d932-44ee-9b32-576aaa5fce13" />
 
 
 ## 🌟 系統功能特性
