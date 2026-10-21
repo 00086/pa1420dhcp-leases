@@ -173,7 +173,10 @@
             .then(res => res.json())
             .then(data => {
                 if (data.status === 'success') {
-                    panel.innerHTML = `<div><span class="text-success fw-bold"><i class="bi bi-check-circle"></i> 抓取成功！</span> 新增：${data.success_count} 筆，略過重複：${data.duplicate_count} 筆</div>
+                    // 👈 新增多重租約的文字標示
+                    let multiMsg = data.multi_lease_count > 0 ? ` <span class="badge bg-warning text-dark ms-1">同 IP 多重租約：${data.multi_lease_count} 筆</span>` : "";
+                    
+                    panel.innerHTML = `<div><span class="text-success fw-bold"><i class="bi bi-check-circle"></i> 抓取成功！</span> 新增：${data.success_count} 筆${multiMsg}，略過重複：${data.duplicate_count} 筆</div>
                                        <button class="btn btn-outline-primary btn-sm" onclick="fetchNow()"><i class="bi bi-arrow-repeat"></i> 再次更新</button>`;
                     document.getElementById('view-date').value = data.date;
                     loadData(1, data.date);
@@ -275,7 +278,10 @@
             .then(res => res.json())
             .then(data => {
                 if (data.status === 'success') {
-                    alert(`✅ ${data.message}\n✨ 成功新增：${data.success_count} 筆\n🔁 略過重複：${data.duplicate_count} 筆`);
+                    // 👈 新增多重租約的文字標示
+                    let multiMsg = data.multi_lease_count > 0 ? `\n⚠️ 其中 ${data.multi_lease_count} 筆為同 IP 之不同時間租約` : "";
+                    
+                    alert(`✅ ${data.message}\n✨ 成功新增：${data.success_count} 筆${multiMsg}\n🔁 略過重複：${data.duplicate_count} 筆`);
                     document.getElementById('view-date').value = data.record_date;
                     loadData(1, data.record_date);
                 } else {

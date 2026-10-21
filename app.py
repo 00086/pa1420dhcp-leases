@@ -110,6 +110,7 @@ def parse_and_insert_xml(xml_bytes, record_date=None):
     entries = root.findall('.//entry')
     success_count = 0
     duplicate_count = 0
+    multi_lease_count = 0 # 👈 新增：統計同 IP 不同時間的次數
 
     for entry in entries:
         ip = entry.findtext('ip', default='').strip()
@@ -123,6 +124,10 @@ def parse_and_insert_xml(xml_bytes, record_date=None):
             continue
 
         try:
+            # 👈 在寫入前，先檢查該日期是否已經有這個 IP 的紀錄
+            cursor.execute("SELECT COUNT(*) FROM dhcp_leases WHERE record_date = ? AND ip = ?", (record_date, ip))
+            ip_exists = cursor.fetchone()[0] > 0
+
             cursor.execute('''
                 INSERT OR IGNORE INTO dhcp_leases 
                 (record_date, ip, mac, hostname, state, duration, leasetime) 
@@ -131,6 +136,9 @@ def parse_and_insert_xml(xml_bytes, record_date=None):
             
             if cursor.rowcount == 1:
                 success_count += 1
+                # 👈 如果寫入成功，且該 IP 先前已存在於同日，代表這是「同 IP 不同時間」的第二筆以上紀錄
+                if ip_exists:
+                    multi_lease_count += 1
             else:
                 duplicate_count += 1
         except sqlite3.Error as e:
@@ -138,8 +146,8 @@ def parse_and_insert_xml(xml_bytes, record_date=None):
 
     conn.commit()
     conn.close()
-    return success_count, duplicate_count
-
+    return success_count, duplicate_count, multi_lease_count # 👈 記得回傳新計數器
+    
 # -------------------------------------------------------------
 # PA-1420 API 抓取作業
 # -------------------------------------------------------------
@@ -150,30 +158,27 @@ def fetch_pa_dhcp_job():
     try:
         fw_ip, interface, api_key, cmd = get_pa_config()
         api_url = f"https://{fw_ip}/api/"
-        params = {
-            "type": "op",
-            "cmd": cmd,
-            "key": api_key
-        }
+        params = {"type": "op", "cmd": cmd, "key": api_key}
 
         response = requests.get(api_url, params=params, verify=False, timeout=30)
         response.raise_for_status()
 
-        success, duplicate = parse_and_insert_xml(response.content, record_date=today_str)
-        print(f"[{datetime.datetime.now()}] PA-1420 抓取完成！新增：{success} 筆，略過重複：{duplicate} 筆")
+        # 👈 接收 multi_lease_count
+        success, duplicate, multi_lease = parse_and_insert_xml(response.content, record_date=today_str)
+        print(f"[{datetime.datetime.now()}] PA-1420 抓取完成！新增：{success} 筆(含多重租約 {multi_lease} 筆)，略過重複：{duplicate} 筆")
         return {
             "status": "success", 
             "success_count": success, 
             "duplicate_count": duplicate, 
+            "multi_lease_count": multi_lease, # 👈 將資料回傳給前端
             "date": today_str,
             "fw_ip": fw_ip,
             "interface": interface
         }
-
     except Exception as e:
         print(f"[{datetime.datetime.now()}] PA-1420 抓取失敗：{str(e)}")
         return {"status": "error", "message": str(e)}
-
+        
 # -------------------------------------------------------------
 # Web 路由
 # -------------------------------------------------------------
@@ -201,18 +206,19 @@ def upload_file():
 
     try:
         file_bytes = file.read()
-        success, duplicate = parse_and_insert_xml(file_bytes, record_date=upload_date)
+        # 👈 接收 multi_lease_count
+        success, duplicate, multi_lease = parse_and_insert_xml(file_bytes, record_date=upload_date)
 
         return jsonify({
             'status': 'success',
             'message': f'檔案已成功匯入至【{upload_date}】！',
             'success_count': success,
             'duplicate_count': duplicate,
+            'multi_lease_count': multi_lease, # 👈 將資料回傳給前端
             'record_date': upload_date
         })
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)})
-
 @app.route('/api/leases', methods=['GET'])
 def get_leases():
     page = int(request.args.get('page', 1))
