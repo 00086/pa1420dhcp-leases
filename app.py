@@ -30,6 +30,62 @@ else:
 # -------------------------------------------------------------
 PA_CONFIG_FILE = "pa1420key.txt"
 
+def fetch_pa_disk_space():
+    """擷取 PA-1420 SSD 磁碟各分區使用狀態"""
+    try:
+        root = run_pa_command("<show><system><disk-space/></system></show>")
+        result_text = root.findtext('.//result', default='')
+
+        partitions = []
+        panlogs_info = None
+
+        # 逐行解析磁碟資訊，跳過標題列
+        lines = result_text.strip().split('\n')
+        for line in lines:
+            parts = line.split()
+            # 確保格式正確 (Filesystem, Size, Used, Avail, Use%, Mounted on)
+            if len(parts) >= 6 and parts[0] != 'Filesystem':
+                fs, size, used, avail, use_pct_str, mount = parts[:6]
+                try:
+                    use_pct = int(use_pct_str.replace('%', ''))
+                except ValueError:
+                    use_pct = 0
+                
+                part_info = {
+                    'filesystem': fs,
+                    'size': size,
+                    'used': used,
+                    'avail': avail,
+                    'percent': use_pct,
+                    'mount': mount
+                }
+                partitions.append(part_info)
+                
+                # 優先抓取最關鍵的 /opt/panlogs 作為標籤主要顯示的基準
+                if mount == '/opt/panlogs':
+                    panlogs_info = part_info
+
+        # 若找不到 panlogs 則抓取根目錄 / 作為標籤基準
+        if not panlogs_info:
+            for p in partitions:
+                if p['mount'] == '/':
+                    panlogs_info = p
+                    break
+
+        if panlogs_info:
+            return {
+                'total': panlogs_info['size'],
+                'used': panlogs_info['used'],
+                'avail': panlogs_info['avail'],
+                'percent': panlogs_info['percent'],
+                'desc': f"{panlogs_info['used']} / {panlogs_info['size']}",
+                'all_partitions': partitions  # 👈 將所有分區清單一併回傳
+            }
+    except Exception as e:
+        print(f"SSD 容量解析異常: {e}")
+
+    return {'total': '-', 'used': '-', 'avail': '-', 'percent': 0, 'desc': '-', 'all_partitions': []}
+    
 def get_pa_config():
     if not os.path.exists(PA_CONFIG_FILE):
         raise FileNotFoundError(f"找不到設定檔案：{PA_CONFIG_FILE}")
@@ -120,6 +176,12 @@ def init_db(db_name="dhcp_records.db"):
         )
     ''')
     
+    # 自動檢查並擴充 disk_usage_pct 欄位 (相容既有 DB)
+    cursor.execute("PRAGMA table_info(system_health_log)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if 'disk_usage_pct' not in columns:
+        cursor.execute("ALTER TABLE system_health_log ADD COLUMN disk_usage_pct REAL DEFAULT 0.0")
+
     conn.commit()
     return conn
 
@@ -296,6 +358,9 @@ def fetch_pa_health_data():
     except Exception as e:
         print("DP CPU 解析異常:", e)
 
+    # 取得 SSD 容量
+    disk_info = fetch_pa_disk_space()
+    
     return {
         'hostname': hostname,
         'model': model,
@@ -307,7 +372,10 @@ def fetch_pa_health_data():
         'mem_desc': mem_desc,
         'active_sessions': active_sessions,
         'max_sessions': max_sessions,
-        'session_usage_pct': session_usage_pct
+        'session_usage_pct': session_usage_pct,
+        'disk_usage_pct': disk_info['percent'],  # 👈 新增 SSD 百分比
+        'disk_desc': disk_info['desc'],          # 👈 新增 SSD 描述 (31G / 112G)
+        'disk_partitions': disk_info['all_partitions'] # 👈 新增這行：回傳所有分區給前端
     }
 
 def log_system_health_job():
@@ -316,20 +384,20 @@ def log_system_health_job():
         conn = init_db()
         cursor = conn.cursor()
         now_str = datetime.datetime.now().isoformat()
-        
+
         cursor.execute('''
-            INSERT INTO system_health_log (record_time, mp_cpu, dp_cpu, mem_usage_pct, active_sessions)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (now_str, data['mp_cpu'], data['dp_cpu'], data['mem_usage_pct'], data['active_sessions']))
-        
+            INSERT INTO system_health_log (record_time, mp_cpu, dp_cpu, mem_usage_pct, active_sessions, disk_usage_pct)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (now_str, data['mp_cpu'], data['dp_cpu'], data['mem_usage_pct'], data['active_sessions'], data.get('disk_usage_pct', 0.0)))
+
         threshold = (datetime.datetime.now() - datetime.timedelta(days=1)).isoformat()
         cursor.execute("DELETE FROM system_health_log WHERE record_time < ?", (threshold,))
-        
+
         conn.commit()
         conn.close()
     except Exception as e:
         print("背景記錄系統健康狀態失敗:", e)
-
+        
 # -------------------------------------------------------------
 # 背景 DNS 解析工作核心與進度追蹤
 # -------------------------------------------------------------
@@ -449,23 +517,24 @@ def get_health_history():
     conn = init_db()
     cursor = conn.cursor()
     cursor.execute('''
-        SELECT record_time, mp_cpu, dp_cpu, mem_usage_pct, active_sessions 
+        SELECT record_time, mp_cpu, dp_cpu, mem_usage_pct, active_sessions, disk_usage_pct 
         FROM system_health_log 
         ORDER BY id DESC LIMIT 180
     ''')
     rows = cursor.fetchall()
     conn.close()
-    
+
     history = [{
         'record_time': r[0],
         'mp_cpu': r[1],
         'dp_cpu': r[2],
         'mem_usage_pct': r[3],
-        'active_sessions': r[4]
+        'active_sessions': r[4],
+        'disk_usage_pct': r[5] if len(r) > 5 and r[5] is not None else 0.0
     } for r in reversed(rows)]
-    
-    return jsonify({'status': 'success', 'history': history})
 
+    return jsonify({'status': 'success', 'history': history})
+    
 @app.route('/api/threat-analytics', methods=['GET'])
 def get_threat_analytics():
     try:

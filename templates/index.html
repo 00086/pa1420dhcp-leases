@@ -120,6 +120,14 @@
                             <small class="text-muted ms-1" id="sys-mem-desc"></small>
                             <i class="bi bi-graph-up text-muted ms-1" style="font-size: 11px;"></i>
                         </span>
+						
+						<!-- 系統 SSD 磁碟狀態 (支援點擊查看趨勢圖) -->
+						<span class="health-badge clickable-badge" title="點擊查看歷史趨勢圖" onclick="openChartModal('disk_usage_pct', 'SSD 日誌儲存空間使用率趨勢 (%)', 'rgb(220, 53, 69)')">
+							<i class="bi bi-device-ssd text-danger me-1"></i>SSD (日誌區): 
+							<strong id="sys-disk" class="font-monospace text-success">0%</strong>
+							<small class="text-muted ms-1" id="sys-disk-desc"></small>
+							<i class="bi bi-graph-up text-muted ms-1" style="font-size: 11px;"></i>
+						</span>
 
                         <!-- 連線數即時容量 -->
                         <div class="d-flex align-items-center gap-2 ps-2 border-start clickable-badge rounded pe-2 py-1" title="點擊查看歷史趨勢圖" onclick="openChartModal('active_sessions', '活躍連線數歷史趨勢', 'rgb(25, 135, 84)')">
@@ -416,22 +424,32 @@
     </div>
 </div>
 
-<!-- ================= 彈出視窗：效能趨勢圖表 ================= -->
+<!-- ================= 彈出視窗：效能趨勢圖表 (極致緊湊 Banner 與內部捲動) ================= -->
 <div class="modal fade" id="chartModal" tabindex="-1" aria-labelledby="chartModalLabel" aria-hidden="true">
-    <div class="modal-dialog modal-lg modal-dialog-centered">
-        <div class="modal-content">
-            <div class="modal-header bg-light py-2">
-                <h5 class="modal-title fw-bold" id="chartModalTitle">效能歷史趨勢圖</h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+    <div class="modal-dialog modal-xl modal-dialog-centered modal-dialog-scrollable">
+        <div class="modal-content shadow">
+            
+            <!-- 頂部 Header Banner (縮小高度至貼合字型) -->
+            <div class="modal-header bg-light py-1 px-3 d-flex align-items-center" style="min-height: 38px;">
+                <h6 class="modal-title fw-bold mb-0 text-dark" id="chartModalTitle" style="font-size: 15px; line-height: 1.2;">效能歷史趨勢圖</h6>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close" style="padding: 6px;"></button>
             </div>
-            <div class="modal-body py-3">
-                <div style="position: relative; height: 320px; width: 100%;">
+            
+            <!-- 內容區 -->
+            <div class="modal-body p-2 px-3">
+                <!-- SSD 各分區詳細列表 (動態填入) -->
+                <div id="chart-extra-details" class="mb-2" style="display: none;"></div>
+
+                <!-- 折線圖容器 -->
+                <div style="position: relative; height: 260px; width: 100%;">
                     <canvas id="healthChart"></canvas>
                 </div>
             </div>
-            <div class="modal-footer py-1 d-flex justify-content-between text-muted small">
+
+            <!-- 底部說明列 -->
+            <div class="modal-footer py-1 px-3 d-flex justify-content-between text-muted small bg-light" style="font-size: 12px;">
                 <span><i class="bi bi-info-circle me-1"></i>系統每 1 分鐘自動採樣記錄，圖表顯示最近 3 小時趨勢 (最多 180 筆)。</span>
-                <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">關閉</button>
+                <button type="button" class="btn btn-secondary btn-sm py-0 px-2" style="font-size: 12px; height: 24px;" data-bs-dismiss="modal">關閉</button>
             </div>
         </div>
     </div>
@@ -439,6 +457,7 @@
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 <script>
+    let latestSystemHealthData = null; // 👈 新增這行全域變數
     const todayStr = new Date().toISOString().split('T')[0];
     let currentDate = todayStr;
     let currentPage = 1;
@@ -450,9 +469,62 @@
     document.getElementById('upload-date').value = todayStr;
     document.getElementById('view-date').value = todayStr;
 
-    // 1. 開啟圖表並繪製
+    // 1. 開啟圖表並繪製 (字型放大一級 + 極致緊湊列高與 Banner)
     function openChartModal(metricKey, title, colorStr) {
-        document.getElementById('chartModalTitle').innerHTML = `<i class="bi bi-graph-up-arrow text-primary"></i> ${title}`;
+        document.getElementById('chartModalTitle').innerHTML = `<i class="bi bi-graph-up-arrow text-primary me-1"></i> ${title}`;
+
+        const extraDetailsDiv = document.getElementById('chart-extra-details');
+        if (extraDetailsDiv) {
+            if (metricKey === 'disk_usage_pct' && latestSystemHealthData && latestSystemHealthData.disk_partitions && latestSystemHealthData.disk_partitions.length > 0) {
+                let tableHtml = `
+                    <div class="card shadow-sm border bg-white mb-2">
+                        <!-- 實體 SSD Banner 列 (高度緊縮貼齊字型) -->
+                        <div class="card-header bg-light py-1 px-2 fw-bold text-dark d-flex justify-content-between align-items-center" style="font-size: 13.5px; line-height: 1.2;">
+                            <span><i class="bi bi-hdd-network text-secondary me-1"></i>實體 SSD 各掛載分區詳細狀態</span>
+                            <span class="badge bg-secondary font-monospace" style="font-size: 11px; padding: 2px 6px;">共 ${latestSystemHealthData.disk_partitions.length} 個分區</span>
+                        </div>
+                        <div class="table-responsive">
+                            <!-- 表格字型放大至 14.5px，單元格內距縮減至 2px 緊貼字型 -->
+                            <table class="table table-sm table-hover align-middle font-monospace text-center mb-0" style="font-size: 14.5px; line-height: 1.25;">
+                                <thead class="table-light">
+                                    <tr style="border-bottom: 1px solid #dee2e6;">
+                                        <th class="text-start ps-3" style="padding-top: 3px; padding-bottom: 3px;">掛載點 (Mount)</th>
+                                        <th style="padding-top: 3px; padding-bottom: 3px;">檔案系統</th>
+                                        <th style="padding-top: 3px; padding-bottom: 3px;">總容量</th>
+                                        <th style="padding-top: 3px; padding-bottom: 3px;">已使用</th>
+                                        <th style="padding-top: 3px; padding-bottom: 3px;">可用空間</th>
+                                        <th class="pe-3" style="padding-top: 3px; padding-bottom: 3px;">使用率</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                `;
+                latestSystemHealthData.disk_partitions.forEach(p => {
+                    let pctClass = p.percent >= 90 ? 'text-danger fw-bold' : (p.percent >= 75 ? 'text-warning text-dark fw-bold' : 'text-success');
+                    tableHtml += `
+                        <tr>
+                            <td class="fw-bold text-start ps-3 text-primary" style="padding-top: 2px; padding-bottom: 2px;">${p.mount}</td>
+                            <td class="text-muted" style="padding-top: 2px; padding-bottom: 2px; font-size: 13px;">${p.filesystem}</td>
+                            <td style="padding-top: 2px; padding-bottom: 2px;">${p.size}</td>
+                            <td style="padding-top: 2px; padding-bottom: 2px;">${p.used}</td>
+                            <td style="padding-top: 2px; padding-bottom: 2px;">${p.avail}</td>
+                            <td class="pe-3" style="padding-top: 2px; padding-bottom: 2px;"><span class="${pctClass}">${p.percent}%</span></td>
+                        </tr>
+                    `;
+                });
+                tableHtml += `
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                `;
+                extraDetailsDiv.innerHTML = tableHtml;
+                extraDetailsDiv.style.display = 'block';
+            } else {
+                extraDetailsDiv.innerHTML = '';
+                extraDetailsDiv.style.display = 'none';
+            }
+        }
+
         chartModalObj.show();
 
         fetch('/api/health-history')
@@ -505,31 +577,46 @@
             })
             .catch(err => console.log('讀取歷史紀錄失敗', err));
     }
-
+	
     // 2. 抓取系統健康即時資訊
     function refreshSystemHealth() {
         fetch('/api/system-health')
             .then(res => res.json())
             .then(data => {
                 if (data.status === 'success') {
+				    latestSystemHealthData = data; // 👈 新增這行，把最新資料存起來給圖表用
                     document.getElementById('sys-hostname').innerText = data.hostname;
                     document.getElementById('sys-model').innerText = data.model;
                     document.getElementById('sys-os').innerText = data.sw_version;
                     document.getElementById('sys-uptime').innerText = data.uptime;
                     
+                    // 1. 更新 MP CPU
                     const mpElem = document.getElementById('sys-mp-cpu');
                     mpElem.innerText = `${data.mp_cpu}%`;
                     mpElem.className = `font-monospace ${data.mp_cpu > 80 ? 'text-danger' : (data.mp_cpu > 50 ? 'text-warning' : 'text-success')}`;
 
+                    // 2. 更新 DP CPU
                     const dpElem = document.getElementById('sys-dp-cpu');
                     dpElem.innerText = `${data.dp_cpu}%`;
                     dpElem.className = `font-monospace ${data.dp_cpu > 80 ? 'text-danger' : (data.dp_cpu > 50 ? 'text-warning' : 'text-success')}`;
 
+                    // 3. 更新記憶體
                     const memElem = document.getElementById('sys-mem');
                     memElem.innerText = `${data.mem_usage_pct}%`;
                     memElem.className = `font-monospace ${data.mem_usage_pct > 85 ? 'text-danger' : (data.mem_usage_pct > 65 ? 'text-warning' : 'text-success')}`;
                     document.getElementById('sys-mem-desc').innerText = data.mem_desc ? `(${data.mem_desc})` : '';
 
+                    // ==========================================
+                    // 👈 4. 更新 SSD 磁碟數據 (加在此處)
+                    // ==========================================
+                    const diskElem = document.getElementById('sys-disk');
+                    if (diskElem && data.disk_usage_pct !== undefined) {
+                        diskElem.innerText = `${data.disk_usage_pct}%`;
+                        diskElem.className = `font-monospace ${data.disk_usage_pct > 90 ? 'text-danger' : (data.disk_usage_pct > 75 ? 'text-warning' : 'text-success')}`;
+                        document.getElementById('sys-disk-desc').innerText = data.disk_desc ? `(${data.disk_desc})` : '';
+                    }
+
+                    // 5. 更新連線數
                     document.getElementById('sys-sessions').innerText = `${data.active_sessions.toLocaleString()} / ${data.max_sessions.toLocaleString()}`;
                     document.getElementById('session-pct').innerText = `${data.session_usage_pct}%`;
                     
@@ -540,7 +627,7 @@
             })
             .catch(err => console.log('系統健康狀態更新失敗', err));
     }
-
+	
 	let arpPollingTimer = null;
 
     // 開啟 ARP 視窗
