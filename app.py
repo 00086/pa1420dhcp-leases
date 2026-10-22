@@ -11,6 +11,7 @@ import time
 import re
 import socket
 import threading
+import ctypes  # 用於 Windows 原生警告視窗
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, render_template, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -19,89 +20,71 @@ import apscheduler.triggers.interval
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# -------------------------------------------------------------
+# Flask 應用程式初始化 (支援 PyInstaller 打包路徑)
+# -------------------------------------------------------------
 if getattr(sys, 'frozen', False):
-    # PyInstaller 解壓縮後的暫存目錄
     base_dir = sys._MEIPASS
     template_folder = os.path.join(base_dir, 'templates')
     app = Flask(__name__, template_folder=template_folder)
+    APP_DIR = os.path.dirname(sys.executable)
 else:
     app = Flask(__name__)
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # -------------------------------------------------------------
-# PA-1420 設定與讀取
+# PA-1420 設定檔路徑定位與防呆
 # -------------------------------------------------------------
-PA_CONFIG_FILE = "pa1420key.txt"
+PA_CONFIG_FILE = os.path.join(APP_DIR, "pa1420key.txt")
 
-def fetch_pa_disk_space():
-    """擷取 PA-1420 SSD 磁碟各分區使用狀態"""
-    try:
-        root = run_pa_command("<show><system><disk-space/></system></show>")
-        result_text = root.findtext('.//result', default='')
+def ensure_pa_config_template():
+    """若不存在設定檔，自動建立範本檔並於 Windows 彈出原生對話框提醒"""
+    if not os.path.exists(PA_CONFIG_FILE):
+        try:
+            sample_content = (
+                "# 第 1 行：PA-1420 防火牆 IP\n"
+                "192.168.1.1\n"
+                "# 第 2 行：監控介面 (例如 ethernet1/1 或 all)\n"
+                "all\n"
+                "# 第 3 行：PA-1420 XML API Key\n"
+                "YOUR_API_KEY_HERE\n"
+            )
+            with open(PA_CONFIG_FILE, "w", encoding="utf-8") as f:
+                f.write(sample_content)
+            print(f"[提示] 已自動在同級目錄建立設定檔範本：{PA_CONFIG_FILE}")
+        except Exception as e:
+            print(f"建立設定檔範本失敗: {e}")
 
-        partitions = []
-        panlogs_info = None
+        # Windows 環境下彈出系統提示框
+        if sys.platform == 'win32':
+            try:
+                msg = (
+                    f"【系統提醒】未偵測到 PA-1420 設定檔案！\n\n"
+                    f"系統已自動於以下路徑建立範本檔：\n{PA_CONFIG_FILE}\n\n"
+                    f"請以文字編輯器開啟並填入真實的防火牆 IP、介面與 API Key，"
+                    f"儲存後即可正常連線。"
+                )
+                ctypes.windll.user32.MessageBoxW(0, msg, "PA-1420 監控系統 - 缺少設定檔", 0x30)
+            except Exception:
+                pass
 
-        # 逐行解析磁碟資訊，跳過標題列
-        lines = result_text.strip().split('\n')
-        for line in lines:
-            parts = line.split()
-            # 確保格式正確 (Filesystem, Size, Used, Avail, Use%, Mounted on)
-            if len(parts) >= 6 and parts[0] != 'Filesystem':
-                fs, size, used, avail, use_pct_str, mount = parts[:6]
-                try:
-                    use_pct = int(use_pct_str.replace('%', ''))
-                except ValueError:
-                    use_pct = 0
-                
-                part_info = {
-                    'filesystem': fs,
-                    'size': size,
-                    'used': used,
-                    'avail': avail,
-                    'percent': use_pct,
-                    'mount': mount
-                }
-                partitions.append(part_info)
-                
-                # 優先抓取最關鍵的 /opt/panlogs 作為標籤主要顯示的基準
-                if mount == '/opt/panlogs':
-                    panlogs_info = part_info
-
-        # 若找不到 panlogs 則抓取根目錄 / 作為標籤基準
-        if not panlogs_info:
-            for p in partitions:
-                if p['mount'] == '/':
-                    panlogs_info = p
-                    break
-
-        if panlogs_info:
-            return {
-                'total': panlogs_info['size'],
-                'used': panlogs_info['used'],
-                'avail': panlogs_info['avail'],
-                'percent': panlogs_info['percent'],
-                'desc': f"{panlogs_info['used']} / {panlogs_info['size']}",
-                'all_partitions': partitions  # 👈 將所有分區清單一併回傳
-            }
-    except Exception as e:
-        print(f"SSD 容量解析異常: {e}")
-
-    return {'total': '-', 'used': '-', 'avail': '-', 'percent': 0, 'desc': '-', 'all_partitions': []}
-    
 def get_pa_config():
     if not os.path.exists(PA_CONFIG_FILE):
         raise FileNotFoundError(f"找不到設定檔案：{PA_CONFIG_FILE}")
 
     with open(PA_CONFIG_FILE, "r", encoding="utf-8") as f:
-        lines = [line.strip() for line in f.readlines() if line.strip()]
+        lines = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
 
     if len(lines) < 3:
         raise ValueError(
-            f"{PA_CONFIG_FILE} 格式錯誤！必須包含三行：\n"
+            f"{PA_CONFIG_FILE} 格式錯誤！必須包含三行有效內容：\n"
             "第 1 行：防火牆 IP\n"
             "第 2 行：介面名稱 (例如 ethernet1/16 或 all)\n"
             "第 3 行：API Key"
         )
+
+    if lines[0] == "192.168.1.1" or "YOUR_API_KEY" in lines[2]:
+        raise ValueError("pa1420key.txt 仍為範本預設值，請填入實際的防火牆 IP 與 API Key！")
 
     fw_ip = lines[0].replace("http://", "").replace("https://", "").rstrip("/")
     interface = lines[1]
@@ -127,6 +110,61 @@ def run_pa_command(cmd_xml):
     return root
 
 # -------------------------------------------------------------
+# SSD 各分割區解析
+# -------------------------------------------------------------
+def fetch_pa_disk_space():
+    """擷取 PA-1420 SSD 磁碟各分區使用狀態"""
+    try:
+        root = run_pa_command("<show><system><disk-space/></system></show>")
+        result_text = root.findtext('.//result', default='')
+
+        partitions = []
+        panlogs_info = None
+
+        lines = result_text.strip().split('\n')
+        for line in lines:
+            parts = line.split()
+            if len(parts) >= 6 and parts[0] != 'Filesystem':
+                fs, size, used, avail, use_pct_str, mount = parts[:6]
+                try:
+                    use_pct = int(use_pct_str.replace('%', ''))
+                except ValueError:
+                    use_pct = 0
+                
+                part_info = {
+                    'filesystem': fs,
+                    'size': size,
+                    'used': used,
+                    'avail': avail,
+                    'percent': use_pct,
+                    'mount': mount
+                }
+                partitions.append(part_info)
+                
+                if mount == '/opt/panlogs':
+                    panlogs_info = part_info
+
+        if not panlogs_info:
+            for p in partitions:
+                if p['mount'] == '/':
+                    panlogs_info = p
+                    break
+
+        if panlogs_info:
+            return {
+                'total': panlogs_info['size'],
+                'used': panlogs_info['used'],
+                'avail': panlogs_info['avail'],
+                'percent': panlogs_info['percent'],
+                'desc': f"{panlogs_info['used']} / {panlogs_info['size']}",
+                'all_partitions': partitions
+            }
+    except Exception as e:
+        print(f"SSD 容量解析異常: {e}")
+
+    return {'total': '-', 'used': '-', 'avail': '-', 'percent': 0, 'desc': '-', 'all_partitions': []}
+
+# -------------------------------------------------------------
 # 資料庫初始化 (含租約、健康歷程、DNS 快取)
 # -------------------------------------------------------------
 def ip_collation(ip1, ip2):
@@ -138,11 +176,11 @@ def ip_collation(ip1, ip2):
         return (ip1 > ip2) - (ip1 < ip2)
 
 def init_db(db_name="dhcp_records.db"):
-    conn = sqlite3.connect(db_name)
+    db_path = os.path.join(APP_DIR, db_name)
+    conn = sqlite3.connect(db_path)
     conn.create_collation("IP_CMP", ip_collation)
     cursor = conn.cursor()
     
-    # 租約主表
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS dhcp_leases (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -157,7 +195,6 @@ def init_db(db_name="dhcp_records.db"):
     ''')
     cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_dhcp_lease_unique ON dhcp_leases(record_date, ip, mac, leasetime)')
 
-    # 系統健康歷程表
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS system_health_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -169,7 +206,6 @@ def init_db(db_name="dhcp_records.db"):
         )
     ''')
 
-    # 固定 IP 反向 DNS 快取表 (永久儲存解析結果)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS ip_hostname_cache (
             ip TEXT PRIMARY KEY,
@@ -178,7 +214,6 @@ def init_db(db_name="dhcp_records.db"):
         )
     ''')
     
-    # 自動檢查並擴充 disk_usage_pct 欄位 (相容既有 DB)
     cursor.execute("PRAGMA table_info(system_health_log)")
     columns = [col[1] for col in cursor.fetchall()]
     if 'disk_usage_pct' not in columns:
@@ -247,7 +282,7 @@ def parse_and_insert_xml(xml_bytes, record_date=None):
     return success_count, duplicate_count, multi_lease_count, unique_ip_count
 
 # -------------------------------------------------------------
-# 狀態追蹤
+# 狀態追蹤與定時作業
 # -------------------------------------------------------------
 last_job_info = {
     "timestamp": 0,
@@ -306,8 +341,6 @@ def fetch_pa_dhcp_job(job_type="auto"):
 # 系統硬體狀態擷取 (MP CPU / DP CPU / RAM / Sessions)
 # -------------------------------------------------------------
 def fetch_pa_health_data():
-    """集中擷取 PA-1420 硬體資訊 (含 MP/DP CPU、記憶體 used+cache、磁碟各分區、連線數)"""
-    # 1. 系統基本資訊
     info_root = run_pa_command("<show><system><info/></system></show>")
     system_elem = info_root.find('.//system')
     
@@ -316,13 +349,11 @@ def fetch_pa_health_data():
     sw_version = system_elem.findtext('sw-version', default='-') if system_elem is not None else '-'
     uptime = system_elem.findtext('uptime', default='-') if system_elem is not None else '-'
 
-    # 2. 連線數統計
     session_root = run_pa_command("<show><session><info/></session></show>")
     active_sessions = int(session_root.findtext('.//num-active', default='0'))
     max_sessions = int(session_root.findtext('.//num-max', default='1'))
     session_usage_pct = round((active_sessions / max_sessions) * 100, 2) if max_sessions > 0 else 0.0
 
-    # 3. MP CPU (管理平面) 與 記憶體 (同時解析 total, used, free, buff/cache)
     mp_cpu = 0.0
     mem_usage_pct = 0.0
     mem_desc = ""
@@ -330,13 +361,11 @@ def fetch_pa_health_data():
         res_root = run_pa_command("<show><system><resources/></system></show>")
         res_text = res_root.findtext('.//result', default='')
         
-        # 解析 MP CPU
         cpu_match = re.search(r'(?:%?Cpu\(s\)|Cpu\(s\)):\s*[\d\.]+%?\s*us,.*?([\d\.]+)%?\s*id', res_text)
         if cpu_match:
             idle = float(cpu_match.group(1))
             mp_cpu = round(max(0.0, 100.0 - idle), 1)
 
-        # 彈性解析記憶體 (相容 PAN-OS 11 的 MiB / KiB / GiB 及小數點，同時提取 buff/cache)
         mem_line_match = re.search(r'([^\n\r]*\bMem\b[^\n\r]*total[^\n\r]*)', res_text, re.IGNORECASE)
         if mem_line_match:
             line = mem_line_match.group(1)
@@ -349,7 +378,6 @@ def fetch_pa_health_data():
                 tot_val = float(tot_m.group(1))
                 line_lower = line.lower()
                 
-                # 自動判斷單位換算係數 (統一換算為 GB)
                 if 'mib' in line_lower:
                     unit_factor = 1 / 1024
                 elif 'gib' in line_lower:
@@ -372,7 +400,6 @@ def fetch_pa_health_data():
     except Exception as e:
         print("MP CPU/Mem 解析異常:", e)
 
-    # 4. DP CPU (資料平面)
     dp_cpu = 0.0
     try:
         dp_root = run_pa_command("<show><running><resource-monitor><second><last>1</last></second></resource-monitor></running></show>")
@@ -386,7 +413,6 @@ def fetch_pa_health_data():
     except Exception as e:
         print("DP CPU 解析異常:", e)
 
-    # 5. SSD 各分區空間解析
     disk_info = fetch_pa_disk_space()
 
     return {
@@ -459,7 +485,8 @@ def background_dns_worker(target_ips):
 
         if name_found:
             try:
-                conn = sqlite3.connect("dhcp_records.db")
+                db_path = os.path.join(APP_DIR, "dhcp_records.db")
+                conn = sqlite3.connect(db_path)
                 cur = conn.cursor()
                 now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 cur.execute("INSERT OR REPLACE INTO ip_hostname_cache (ip, hostname, updated_at) VALUES (?, ?, ?)",
@@ -522,6 +549,29 @@ def fetch_pa_threat_logs(count=100):
 @app.route('/')
 def index():
     return render_template('index.html')
+
+@app.route('/api/config-status', methods=['GET'])
+def get_config_status():
+    if not os.path.exists(PA_CONFIG_FILE):
+        return jsonify({
+            'status': 'missing',
+            'message': f'找不到設定檔案！系統已建立範本檔，請填寫：{PA_CONFIG_FILE}',
+            'path': PA_CONFIG_FILE
+        })
+    try:
+        fw_ip, interface, _, _ = get_pa_config()
+        return jsonify({
+            'status': 'ok',
+            'message': '設定檔配置正確',
+            'fw_ip': fw_ip,
+            'interface': interface
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'invalid',
+            'message': str(e),
+            'path': PA_CONFIG_FILE
+        })
 
 @app.route('/api/fetch-now', methods=['POST'])
 def trigger_fetch_now():
@@ -808,12 +858,15 @@ def get_leases():
 # 定時排程器
 # -------------------------------------------------------------
 scheduler = BackgroundScheduler(timezone="Asia/Taipei")
-# DHCP 每日排程抓取 (6 次/日)
 scheduler.add_job(fetch_pa_dhcp_job, args=['auto'], trigger='cron', hour='1,5,9,13,17,21', minute=0)
-# 系統效能每 1 分鐘自動寫入 DB 供圖表繪製
 scheduler.add_job(log_system_health_job, trigger='interval', minutes=1)
 scheduler.start()
 
 if __name__ == '__main__':
-    log_system_health_job()
+    ensure_pa_config_template()
+    try:
+        get_pa_config()
+        log_system_health_job()
+    except Exception as e:
+        print(f"[啟動提示] {e}")
     app.run(host='0.0.0.0', port=5006, debug=True, use_reloader=False)

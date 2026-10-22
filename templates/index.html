@@ -83,6 +83,19 @@
 <body class="d-flex flex-column">
 
 <div class="container-fluid d-flex flex-column h-100 p-3">
+	<!-- 👈 設定檔缺失/錯誤 置頂警示橫幅 (預設隱藏) -->
+    <div id="config-alert-banner" class="alert alert-danger shadow-sm mb-2 d-none d-flex justify-content-between align-items-center py-2 px-3">
+        <div class="d-flex align-items-center gap-2">
+            <i class="bi bi-exclamation-octagon-fill fs-5 text-danger"></i>
+            <div>
+                <strong class="d-block" id="config-alert-title">未偵測到有效的連線設定檔 (pa1420key.txt)</strong>
+                <small id="config-alert-msg" class="text-secondary font-monospace"></small>
+            </div>
+        </div>
+        <button class="btn btn-sm btn-outline-danger" onclick="checkConfigStatus(true)">
+            <i class="bi bi-arrow-clockwise"></i> 存檔後點此重新偵測
+        </button>
+    </div>
     
     <!-- 最頂層：PA-1420 系統健康即時資訊看板 (含 MP/DP 雙 CPU 與記憶體，支援點擊查圖表) -->
     <div class="row mb-2 flex-shrink-0">
@@ -468,7 +481,37 @@
 
     document.getElementById('upload-date').value = todayStr;
     document.getElementById('view-date').value = todayStr;
+	
+	// 檢查 pa1420key.txt 狀態
+    function checkConfigStatus(manual = false) {
+        fetch('/api/config-status')
+            .then(res => res.json())
+            .then(data => {
+                const banner = document.getElementById('config-alert-banner');
+                if (data.status !== 'ok') {
+                    banner.classList.remove('d-none');
+                    document.getElementById('config-alert-msg').innerText = data.message;
+                    if (manual) alert(`❌ 設定檔檢查失敗：\n${data.message}`);
+                } else {
+                    banner.classList.add('d-none');
+                    if (manual) {
+                        alert('✅ 設定檔驗證成功！正在嘗試連線 PA-1420...');
+                        refreshSystemHealth();
+                        fetchNow();
+                    }
+                }
+            })
+            .catch(err => console.log('檢查設定檔狀態異常:', err));
+    }
 
+    // 頁面載入完成時先執行檢查
+    document.addEventListener('DOMContentLoaded', () => {
+        checkConfigStatus(); // 👈 檢查設定檔
+        updateNextScheduleDisplay();
+        refreshSystemHealth();
+        loadData(1);
+    });
+	
     // 1. 開啟圖表並繪製 (字型放大一級 + 極致緊湊列高與 Banner)
     function openChartModal(metricKey, title, colorStr) {
         document.getElementById('chartModalTitle').innerHTML = `<i class="bi bi-graph-up-arrow text-primary me-1"></i> ${title}`;
