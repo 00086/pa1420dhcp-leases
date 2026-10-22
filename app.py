@@ -8,6 +8,10 @@ import xml.etree.ElementTree as ET
 import requests
 import urllib3
 import time
+import re
+import socket
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, render_template, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -52,8 +56,20 @@ def get_pa_config():
 
     return fw_ip, interface, api_key, cmd
 
+def run_pa_command(cmd_xml):
+    fw_ip, _, api_key, _ = get_pa_config()
+    api_url = f"https://{fw_ip}/api/"
+    params = {"type": "op", "cmd": cmd_xml, "key": api_key}
+    response = requests.get(api_url, params=params, verify=False, timeout=15)
+    response.raise_for_status()
+    root = ET.fromstring(response.content)
+    if root.attrib.get('status') == 'error':
+        err_msg = root.findtext('.//msg') or "PA API 回應錯誤"
+        raise ValueError(err_msg)
+    return root
+
 # -------------------------------------------------------------
-# 資料庫與自然 IP 排序
+# 資料庫初始化 (含租約、健康歷程、DNS 快取)
 # -------------------------------------------------------------
 def ip_collation(ip1, ip2):
     try:
@@ -68,7 +84,7 @@ def init_db(db_name="dhcp_records.db"):
     conn.create_collation("IP_CMP", ip_collation)
     cursor = conn.cursor()
     
-    # 建立主表
+    # 租約主表
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS dhcp_leases (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,16 +97,32 @@ def init_db(db_name="dhcp_records.db"):
             leasetime TEXT
         )
     ''')
-    
-    # 明確建立四欄位複合唯一索引：日期、IP、MAC、租約時間皆相同才視為重複
+    cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_dhcp_lease_unique ON dhcp_leases(record_date, ip, mac, leasetime)')
+
+    # 系統健康歷程表
     cursor.execute('''
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_dhcp_lease_unique 
-        ON dhcp_leases(record_date, ip, mac, leasetime)
+        CREATE TABLE IF NOT EXISTS system_health_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            record_time TEXT NOT NULL,
+            mp_cpu REAL,
+            dp_cpu REAL,
+            mem_usage_pct REAL,
+            active_sessions INTEGER
+        )
+    ''')
+
+    # 固定 IP 反向 DNS 快取表 (永久儲存解析結果)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ip_hostname_cache (
+            ip TEXT PRIMARY KEY,
+            hostname TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
     ''')
     
     conn.commit()
     return conn
-    
+
 def parse_and_insert_xml(xml_bytes, record_date=None):
     if record_date is None:
         record_date = datetime.date.today().isoformat()
@@ -111,7 +143,7 @@ def parse_and_insert_xml(xml_bytes, record_date=None):
     entries = root.findall('.//entry')
     success_count = 0
     duplicate_count = 0
-    multi_lease_count = 0 # 👈 新增：統計同 IP 不同時間的次數
+    multi_lease_count = 0
 
     for entry in entries:
         ip = entry.findtext('ip', default='').strip()
@@ -125,7 +157,6 @@ def parse_and_insert_xml(xml_bytes, record_date=None):
             continue
 
         try:
-            # 👈 在寫入前，先檢查該日期是否已經有這個 IP 的紀錄
             cursor.execute("SELECT COUNT(*) FROM dhcp_leases WHERE record_date = ? AND ip = ?", (record_date, ip))
             ip_exists = cursor.fetchone()[0] > 0
 
@@ -137,7 +168,6 @@ def parse_and_insert_xml(xml_bytes, record_date=None):
             
             if cursor.rowcount == 1:
                 success_count += 1
-                # 👈 如果寫入成功，且該 IP 先前已存在於同日，代表這是「同 IP 不同時間」的第二筆以上紀錄
                 if ip_exists:
                     multi_lease_count += 1
             else:
@@ -145,12 +175,15 @@ def parse_and_insert_xml(xml_bytes, record_date=None):
         except sqlite3.Error as e:
             print(f"DB Error: {e}")
 
+    cursor.execute("SELECT COUNT(DISTINCT ip) FROM dhcp_leases WHERE record_date = ?", (record_date,))
+    unique_ip_count = cursor.fetchone()[0]
+
     conn.commit()
     conn.close()
-    return success_count, duplicate_count, multi_lease_count # 👈 記得回傳新計數器
+    return success_count, duplicate_count, multi_lease_count, unique_ip_count
 
 # -------------------------------------------------------------
-# 狀態追蹤 (用於讓前端網頁知道排程最新狀態)
+# 狀態追蹤
 # -------------------------------------------------------------
 last_job_info = {
     "timestamp": 0,
@@ -162,10 +195,7 @@ last_job_info = {
     "multi_lease_count": 0,
     "date": ""
 }
-    
-# -------------------------------------------------------------
-# PA-1420 API 抓取作業 (加入 job_type 與全域狀態更新)
-# -------------------------------------------------------------
+
 def fetch_pa_dhcp_job(job_type="auto"):
     global last_job_info
     today_str = datetime.date.today().isoformat()
@@ -179,21 +209,22 @@ def fetch_pa_dhcp_job(job_type="auto"):
         response = requests.get(api_url, params=params, verify=False, timeout=30)
         response.raise_for_status()
 
-        success, duplicate, multi_lease = parse_and_insert_xml(response.content, record_date=today_str)
-        print(f"[{datetime.datetime.now()}] PA-1420 抓取完成！新增：{success} 筆(含多重租約 {multi_lease} 筆)，略過重複：{duplicate} 筆")
+        success, duplicate, multi_lease, unique_ip_count = parse_and_insert_xml(response.content, record_date=today_str)
+        print(f"[{datetime.datetime.now()}] PA-1420 抓取完成！新增：{success} 筆(含多重租約 {multi_lease} 筆)，略過重複：{duplicate} 筆，今日不重複 IP：{unique_ip_count} 筆")
         
         result = {
             "timestamp": time.time(),
-            "type": job_type,       # 標記是 auto 還是 manual
+            "type": job_type,
             "status": "success", 
             "success_count": success, 
             "duplicate_count": duplicate, 
             "multi_lease_count": multi_lease,
+            "unique_ip_count": unique_ip_count,
             "date": today_str,
             "fw_ip": fw_ip,
             "interface": interface
         }
-        last_job_info = result      # 👈 寫入全域狀態供前端抓取
+        last_job_info = result
         return result
 
     except Exception as e:
@@ -204,8 +235,190 @@ def fetch_pa_dhcp_job(job_type="auto"):
             "status": "error",
             "message": str(e)
         }
-        last_job_info = result      # 👈 寫入全域錯誤狀態
+        last_job_info = result
         return result
+
+# -------------------------------------------------------------
+# 系統硬體狀態擷取 (MP CPU / DP CPU / RAM / Sessions)
+# -------------------------------------------------------------
+def fetch_pa_health_data():
+    info_root = run_pa_command("<show><system><info/></system></show>")
+    system_elem = info_root.find('.//system')
+    
+    hostname = system_elem.findtext('hostname', default='PA-1420') if system_elem is not None else 'PA-1420'
+    model = system_elem.findtext('model', default='PA-1420') if system_elem is not None else 'PA-1420'
+    sw_version = system_elem.findtext('sw-version', default='-') if system_elem is not None else '-'
+    uptime = system_elem.findtext('uptime', default='-') if system_elem is not None else '-'
+
+    session_root = run_pa_command("<show><session><info/></session></show>")
+    active_sessions = int(session_root.findtext('.//num-active', default='0'))
+    max_sessions = int(session_root.findtext('.//num-max', default='1'))
+    session_usage_pct = round((active_sessions / max_sessions) * 100, 2) if max_sessions > 0 else 0.0
+
+    mp_cpu = 0.0
+    mem_usage_pct = 0.0
+    mem_desc = ""
+    try:
+        res_root = run_pa_command("<show><system><resources/></system></show>")
+        res_text = res_root.findtext('.//result', default='')
+        
+        cpu_match = re.search(r'(?:%?Cpu\(s\)|Cpu\(s\)):\s*[\d\.]+%?\s*us,.*?([\d\.]+)%?\s*id', res_text)
+        if cpu_match:
+            idle = float(cpu_match.group(1))
+            mp_cpu = round(max(0.0, 100.0 - idle), 1)
+
+        mem_match = re.search(r'(?:KiB\s+Mem|Mem)\s*:\s*(\d+)k?\s*total,\s*(?:(\d+)k?\s*free,\s*)?(\d+)k?\s*used', res_text)
+        if not mem_match:
+            mem_match = re.search(r'(?:KiB\s+Mem|Mem)\s*:\s*(\d+)k?\s*total,\s*(\d+)k?\s*used', res_text)
+            if mem_match:
+                tot_k = float(mem_match.group(1))
+                usd_k = float(mem_match.group(2))
+                mem_usage_pct = round((usd_k / tot_k) * 100, 1) if tot_k > 0 else 0.0
+                mem_desc = f"{round(usd_k/1024/1024, 1)}G / {round(tot_k/1024/1024, 1)}G"
+        else:
+            tot_k = float(mem_match.group(1))
+            usd_k = float(mem_match.group(3))
+            mem_usage_pct = round((usd_k / tot_k) * 100, 1) if tot_k > 0 else 0.0
+            mem_desc = f"{round(usd_k/1024/1024, 1)}G / {round(tot_k/1024/1024, 1)}G"
+    except Exception as e:
+        print("MP CPU/Mem 解析異常:", e)
+
+    dp_cpu = 0.0
+    try:
+        dp_root = run_pa_command("<show><running><resource-monitor><second><last>1</last></second></resource-monitor></running></show>")
+        vals = [float(e.text.strip()) for e in dp_root.findall('.//cpu-load-average//value') if e.text and e.text.strip().replace('.','',1).isdigit()]
+        if not vals:
+            dp_root = run_pa_command("<show><running><resource-monitor><minute><last>1</last></minute></resource-monitor></running></show>")
+            vals = [float(e.text.strip()) for e in dp_root.findall('.//cpu-load-average//value') if e.text and e.text.strip().replace('.','',1).isdigit()]
+        
+        if vals:
+            dp_cpu = round(sum(vals) / len(vals), 1)
+    except Exception as e:
+        print("DP CPU 解析異常:", e)
+
+    return {
+        'hostname': hostname,
+        'model': model,
+        'sw_version': sw_version,
+        'uptime': uptime,
+        'mp_cpu': mp_cpu,
+        'dp_cpu': dp_cpu,
+        'mem_usage_pct': mem_usage_pct,
+        'mem_desc': mem_desc,
+        'active_sessions': active_sessions,
+        'max_sessions': max_sessions,
+        'session_usage_pct': session_usage_pct
+    }
+
+def log_system_health_job():
+    try:
+        data = fetch_pa_health_data()
+        conn = init_db()
+        cursor = conn.cursor()
+        now_str = datetime.datetime.now().isoformat()
+        
+        cursor.execute('''
+            INSERT INTO system_health_log (record_time, mp_cpu, dp_cpu, mem_usage_pct, active_sessions)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (now_str, data['mp_cpu'], data['dp_cpu'], data['mem_usage_pct'], data['active_sessions']))
+        
+        threshold = (datetime.datetime.now() - datetime.timedelta(days=1)).isoformat()
+        cursor.execute("DELETE FROM system_health_log WHERE record_time < ?", (threshold,))
+        
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print("背景記錄系統健康狀態失敗:", e)
+
+# -------------------------------------------------------------
+# 背景 DNS 解析工作核心與進度追蹤
+# -------------------------------------------------------------
+dns_worker_status = {
+    "is_running": False,
+    "total": 0,
+    "done": 0
+}
+dns_lock = threading.Lock()
+
+def background_dns_worker(target_ips):
+    global dns_worker_status
+    with dns_lock:
+        dns_worker_status["is_running"] = True
+        dns_worker_status["total"] = len(target_ips)
+        dns_worker_status["done"] = 0
+
+    print(f"\n[背景 DNS 任務] 啟動，準備深度解析 {len(target_ips)} 筆固定 IP...")
+
+    def resolve_single_ip(target_ip):
+        global dns_worker_status
+        name_found = None
+        try:
+            old_timeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(3.0)
+            fqdn = socket.gethostbyaddr(target_ip)[0]
+            socket.setdefaulttimeout(old_timeout)
+            name_found = fqdn.split('.')[0] if '.' in fqdn else fqdn
+        except Exception:
+            pass
+
+        if name_found:
+            try:
+                conn = sqlite3.connect("dhcp_records.db")
+                cur = conn.cursor()
+                now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cur.execute("INSERT OR REPLACE INTO ip_hostname_cache (ip, hostname, updated_at) VALUES (?, ?, ?)",
+                            (target_ip, name_found, now_str))
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                print(f"寫入快取異常: {e}")
+
+        with dns_lock:
+            dns_worker_status["done"] += 1
+
+    with ThreadPoolExecutor(max_workers=15) as executor:
+        executor.map(resolve_single_ip, target_ips)
+
+    with dns_lock:
+        dns_worker_status["is_running"] = False
+    print(f"[背景 DNS 任務] 解析完成！共處理 {len(target_ips)} 筆。")
+
+# -------------------------------------------------------------
+# 資安威脅日誌擷取
+# -------------------------------------------------------------
+def fetch_pa_threat_logs(count=100):
+    fw_ip, _, api_key, _ = get_pa_config()
+    api_url = f"https://{fw_ip}/api/"
+    
+    query_params = {
+        "type": "log",
+        "log-type": "threat",
+        "nlogs": str(count),
+        "key": api_key
+    }
+    resp = requests.get(api_url, params=query_params, verify=False, timeout=15)
+    resp.raise_for_status()
+    root = ET.fromstring(resp.content)
+    
+    job_id = root.findtext('.//job')
+    if not job_id:
+        raise ValueError(root.findtext('.//msg') or "無法取得 Log Job ID")
+    
+    for _ in range(10):
+        time.sleep(0.5)
+        poll_params = {
+            "type": "log",
+            "action": "get",
+            "job-id": job_id,
+            "key": api_key
+        }
+        poll_resp = requests.get(api_url, params=poll_params, verify=False, timeout=15)
+        poll_root = ET.fromstring(poll_resp.content)
+        status = poll_root.findtext('.//status')
+        if status == 'FIN':
+            return poll_root
+            
+    raise TimeoutError("查詢 PA-1420 威脅日誌逾時")
 
 # -------------------------------------------------------------
 # Web 路由
@@ -216,14 +429,210 @@ def index():
 
 @app.route('/api/fetch-now', methods=['POST'])
 def trigger_fetch_now():
-    # 標記為手動抓取
     result = fetch_pa_dhcp_job(job_type="manual")
     return jsonify(result)
 
-# 👈 新增：提供前端輪詢最新狀態的 API
 @app.route('/api/latest-status', methods=['GET'])
 def get_latest_status():
     return jsonify(last_job_info)
+
+@app.route('/api/system-health', methods=['GET'])
+def get_system_health():
+    try:
+        data = fetch_pa_health_data()
+        return jsonify({'status': 'success', **data})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)})
+
+@app.route('/api/health-history', methods=['GET'])
+def get_health_history():
+    conn = init_db()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT record_time, mp_cpu, dp_cpu, mem_usage_pct, active_sessions 
+        FROM system_health_log 
+        ORDER BY id DESC LIMIT 180
+    ''')
+    rows = cursor.fetchall()
+    conn.close()
+    
+    history = [{
+        'record_time': r[0],
+        'mp_cpu': r[1],
+        'dp_cpu': r[2],
+        'mem_usage_pct': r[3],
+        'active_sessions': r[4]
+    } for r in reversed(rows)]
+    
+    return jsonify({'status': 'success', 'history': history})
+
+@app.route('/api/threat-analytics', methods=['GET'])
+def get_threat_analytics():
+    try:
+        log_root = fetch_pa_threat_logs(count=150)
+        entries = log_root.findall('.//entry')
+
+        today_str = datetime.date.today().isoformat()
+        conn = init_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT ip, mac, hostname FROM dhcp_leases WHERE record_date = ?", (today_str,))
+        dhcp_map = {r[0]: {'mac': r[1], 'hostname': r[2]} for r in cursor.fetchall()}
+        conn.close()
+
+        records = []
+        source_counter = {}
+        threat_counter = {}
+        severity_dist = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'informational': 0}
+
+        for entry in entries:
+            src = entry.findtext('src', default='').strip()
+            dst = entry.findtext('dst', default='').strip()
+            threat_name = entry.findtext('threatid', default=entry.findtext('threat_name', default='未知威脅')).strip()
+            subtype = entry.findtext('subtype', default='-').strip()
+            severity = (entry.findtext('severity', default='low') or 'low').lower()
+            action = entry.findtext('action', default='deny').strip()
+            log_time = entry.findtext('time_generated', default=entry.findtext('receive_time', default='-')).strip()
+            app_name = entry.findtext('app', default='-').strip()
+
+            if severity in severity_dist:
+                severity_dist[severity] += 1
+            else:
+                severity_dist['low'] += 1
+
+            source_counter[src] = source_counter.get(src, 0) + 1
+            threat_counter[threat_name] = threat_counter.get(threat_name, 0) + 1
+
+            dhcp_info = dhcp_map.get(src, {})
+            records.append({
+                'time': log_time,
+                'src': src,
+                'hostname': dhcp_info.get('hostname', '-'),
+                'mac': dhcp_info.get('mac', '-'),
+                'is_internal': src in dhcp_map,
+                'dst': dst,
+                'threat_name': threat_name,
+                'subtype': subtype,
+                'severity': severity,
+                'action': action,
+                'app': app_name
+            })
+
+        top_sources = sorted(source_counter.items(), key=lambda x: x[1], reverse=True)[:5]
+        top_sources_data = [{
+            'ip': ip,
+            'count': count,
+            'hostname': dhcp_map.get(ip, {}).get('hostname', '外部/非DHCP'),
+            'mac': dhcp_map.get(ip, {}).get('mac', '-')
+        } for ip, count in top_sources]
+
+        top_threats = sorted(threat_counter.items(), key=lambda x: x[1], reverse=True)[:5]
+        top_threats_data = [{'threat_name': name, 'count': count} for name, count in top_threats]
+
+        return jsonify({
+            'status': 'success',
+            'total_threats': len(records),
+            'severity_dist': severity_dist,
+            'top_sources': top_sources_data,
+            'top_threats': top_threats_data,
+            'logs': records[:50]
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)})
+
+@app.route('/api/arp-analysis', methods=['GET'])
+def get_arp_analysis():
+    query_date = request.args.get('date', datetime.date.today().isoformat())
+    try:
+        arp_root = run_pa_command("<show><arp><entry name='all'/></arp></show>")
+        arp_entries = arp_root.findall('.//entry')
+
+        conn = init_db()
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT ip, mac, hostname FROM dhcp_leases WHERE record_date = ?", (query_date,))
+        dhcp_records = {row[0]: {'mac': row[1].lower(), 'hostname': row[2]} for row in cursor.fetchall()}
+
+        cursor.execute("SELECT mac, hostname FROM dhcp_leases WHERE hostname != '' AND hostname IS NOT NULL ORDER BY id ASC")
+        historical_mac_map = {row[0].lower(): row[1] for row in cursor.fetchall()}
+
+        cursor.execute("SELECT ip, hostname FROM ip_hostname_cache")
+        dns_cache_map = {row[0]: row[1] for row in cursor.fetchall()}
+        conn.close()
+
+        results = []
+        static_ip_count = 0
+        normal_dhcp_count = 0
+        conflict_count = 0
+        uncached_static_ips = []
+
+        for entry in arp_entries:
+            ip = entry.findtext('ip', default='').strip()
+            mac = entry.findtext('mac', default='').strip().lower()
+            interface = entry.findtext('interface', default='').strip()
+            status = entry.findtext('status', default='').strip()
+
+            if not ip or not mac or mac == '(incomplete)' or status == 'i':
+                continue
+
+            if ip in dhcp_records:
+                dhcp_mac = dhcp_records[ip]['mac']
+                hostname = dhcp_records[ip]['hostname'] or '(無主機名)'
+                if dhcp_mac == mac:
+                    dev_type = "DHCP 動態配發"
+                    tag_class = "success"
+                    normal_dhcp_count += 1
+                else:
+                    dev_type = "⚠️ IP 衝突/MAC變更"
+                    tag_class = "danger"
+                    conflict_count += 1
+            else:
+                dev_type = "🚨 私設/固定 IP (Static IP)"
+                tag_class = "warning"
+                static_ip_count += 1
+
+                if ip in dns_cache_map:
+                    hostname = f"<span class='text-primary fw-bold'><i class='bi bi-globe me-1'></i>{dns_cache_map[ip]}</span>"
+                elif mac in historical_mac_map:
+                    hostname = f"<span class='text-secondary'><i class='bi bi-clock-history me-1'></i>{historical_mac_map[mac]} (歷史)</span>"
+                    uncached_static_ips.append(ip)
+                else:
+                    if dns_worker_status["is_running"]:
+                        hostname = "<span class='text-muted'><div class='spinner-grow spinner-grow-sm text-secondary me-1'></div>解析中...</span>"
+                    else:
+                        hostname = "<span class='text-muted'>待解析</span>"
+                    uncached_static_ips.append(ip)
+
+            results.append({
+                'ip': ip,
+                'mac': mac,
+                'interface': interface,
+                'hostname': hostname,
+                'dev_type': dev_type,
+                'tag_class': tag_class
+            })
+
+        if uncached_static_ips and not dns_worker_status["is_running"]:
+            t = threading.Thread(target=background_dns_worker, args=(uncached_static_ips,), daemon=True)
+            t.start()
+
+        results.sort(key=lambda x: int(ipaddress.IPv4Address(x['ip'])) if x['ip'].replace('.','').isdigit() else 0)
+
+        return jsonify({
+            'status': 'success',
+            'date': query_date,
+            'total_arp': len(results),
+            'static_ip_count': static_ip_count,
+            'normal_dhcp_count': normal_dhcp_count,
+            'conflict_count': conflict_count,
+            'dns_progress': {
+                'is_running': dns_worker_status["is_running"],
+                'total': dns_worker_status["total"],
+                'done': dns_worker_status["done"]
+            },
+            'data': results
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)})
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
@@ -240,19 +649,20 @@ def upload_file():
 
     try:
         file_bytes = file.read()
-        # 👈 接收 multi_lease_count
-        success, duplicate, multi_lease = parse_and_insert_xml(file_bytes, record_date=upload_date)
+        success, duplicate, multi_lease, unique_ip_count = parse_and_insert_xml(file_bytes, record_date=upload_date)
 
         return jsonify({
             'status': 'success',
             'message': f'檔案已成功匯入至【{upload_date}】！',
             'success_count': success,
             'duplicate_count': duplicate,
-            'multi_lease_count': multi_lease, # 👈 將資料回傳給前端
+            'multi_lease_count': multi_lease,
+            'unique_ip_count': unique_ip_count,
             'record_date': upload_date
         })
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)})
+        
 @app.route('/api/leases', methods=['GET'])
 def get_leases():
     page = int(request.args.get('page', 1))
@@ -268,7 +678,6 @@ def get_leases():
 
     offset = (page - 1) * per_page
     
-    # 依 IP 數值排序，同一 IP 則依 id (先後順序) 排列
     cursor.execute('''
         SELECT ip, mac, hostname, state, duration, leasetime, record_date
         FROM dhcp_leases 
@@ -299,12 +708,15 @@ def get_leases():
     })
     
 # -------------------------------------------------------------
-# 定時排程器：每日 01:00、05:00、09:00、13:00、17:00、21:00 自動執行
+# 定時排程器
 # -------------------------------------------------------------
 scheduler = BackgroundScheduler(timezone="Asia/Taipei")
-# 👈 修改為 args=['auto'] 並更新時間頻率
+# DHCP 每日排程抓取 (6 次/日)
 scheduler.add_job(fetch_pa_dhcp_job, args=['auto'], trigger='cron', hour='1,5,9,13,17,21', minute=0)
+# 系統效能每 1 分鐘自動寫入 DB 供圖表繪製
+scheduler.add_job(log_system_health_job, trigger='interval', minutes=1)
 scheduler.start()
 
 if __name__ == '__main__':
+    log_system_health_job()
     app.run(host='0.0.0.0', port=5006, debug=True, use_reloader=False)
