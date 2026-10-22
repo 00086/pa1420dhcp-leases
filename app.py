@@ -304,6 +304,8 @@ def fetch_pa_dhcp_job(job_type="auto"):
 # 系統硬體狀態擷取 (MP CPU / DP CPU / RAM / Sessions)
 # -------------------------------------------------------------
 def fetch_pa_health_data():
+    """集中擷取 PA-1420 硬體資訊 (含 MP/DP CPU、記憶體 used+cache、磁碟各分區、連線數)"""
+    # 1. 系統基本資訊
     info_root = run_pa_command("<show><system><info/></system></show>")
     system_elem = info_root.find('.//system')
     
@@ -312,11 +314,13 @@ def fetch_pa_health_data():
     sw_version = system_elem.findtext('sw-version', default='-') if system_elem is not None else '-'
     uptime = system_elem.findtext('uptime', default='-') if system_elem is not None else '-'
 
+    # 2. 連線數統計
     session_root = run_pa_command("<show><session><info/></session></show>")
     active_sessions = int(session_root.findtext('.//num-active', default='0'))
     max_sessions = int(session_root.findtext('.//num-max', default='1'))
     session_usage_pct = round((active_sessions / max_sessions) * 100, 2) if max_sessions > 0 else 0.0
 
+    # 3. MP CPU (管理平面) 與 記憶體 (同時解析 total, used, free, buff/cache)
     mp_cpu = 0.0
     mem_usage_pct = 0.0
     mem_desc = ""
@@ -324,27 +328,49 @@ def fetch_pa_health_data():
         res_root = run_pa_command("<show><system><resources/></system></show>")
         res_text = res_root.findtext('.//result', default='')
         
+        # 解析 MP CPU
         cpu_match = re.search(r'(?:%?Cpu\(s\)|Cpu\(s\)):\s*[\d\.]+%?\s*us,.*?([\d\.]+)%?\s*id', res_text)
         if cpu_match:
             idle = float(cpu_match.group(1))
             mp_cpu = round(max(0.0, 100.0 - idle), 1)
 
-        mem_match = re.search(r'(?:KiB\s+Mem|Mem)\s*:\s*(\d+)k?\s*total,\s*(?:(\d+)k?\s*free,\s*)?(\d+)k?\s*used', res_text)
-        if not mem_match:
-            mem_match = re.search(r'(?:KiB\s+Mem|Mem)\s*:\s*(\d+)k?\s*total,\s*(\d+)k?\s*used', res_text)
-            if mem_match:
-                tot_k = float(mem_match.group(1))
-                usd_k = float(mem_match.group(2))
-                mem_usage_pct = round((usd_k / tot_k) * 100, 1) if tot_k > 0 else 0.0
-                mem_desc = f"{round(usd_k/1024/1024, 1)}G / {round(tot_k/1024/1024, 1)}G"
-        else:
-            tot_k = float(mem_match.group(1))
-            usd_k = float(mem_match.group(3))
-            mem_usage_pct = round((usd_k / tot_k) * 100, 1) if tot_k > 0 else 0.0
-            mem_desc = f"{round(usd_k/1024/1024, 1)}G / {round(tot_k/1024/1024, 1)}G"
+        # 彈性解析記憶體 (相容 PAN-OS 11 的 MiB / KiB / GiB 及小數點，同時提取 buff/cache)
+        mem_line_match = re.search(r'([^\n\r]*\bMem\b[^\n\r]*total[^\n\r]*)', res_text, re.IGNORECASE)
+        if mem_line_match:
+            line = mem_line_match.group(1)
+            tot_m = re.search(r'([\d\.]+)\s*([kKmMgGtT]?i?B?)?\s*total', line, re.IGNORECASE)
+            usd_m = re.search(r'([\d\.]+)\s*([kKmMgGtT]?i?B?)?\s*used', line, re.IGNORECASE)
+            free_m = re.search(r'([\d\.]+)\s*([kKmMgGtT]?i?B?)?\s*free', line, re.IGNORECASE)
+            cache_m = re.search(r'([\d\.]+)\s*([kKmMgGtT]?i?B?)?\s*(?:buff/cache|cache|buffers)', line, re.IGNORECASE)
+
+            if tot_m:
+                tot_val = float(tot_m.group(1))
+                line_lower = line.lower()
+                
+                # 自動判斷單位換算係數 (統一換算為 GB)
+                if 'mib' in line_lower:
+                    unit_factor = 1 / 1024
+                elif 'gib' in line_lower:
+                    unit_factor = 1.0
+                elif 'kib' in line_lower or 'k total' in line_lower:
+                    unit_factor = 1 / (1024 * 1024)
+                else:
+                    unit_factor = 1 / (1024 * 1024) if tot_val > 1000000 else (1 / 1024 if tot_val > 1000 else 1.0)
+
+                tot_g = round(tot_val * unit_factor, 1)
+                usd_g = round(float(usd_m.group(1)) * unit_factor, 1) if usd_m else 0.0
+                cache_g = round(float(cache_m.group(1)) * unit_factor, 1) if cache_m else 0.0
+
+                if tot_g > 0:
+                    mem_usage_pct = round((usd_g / tot_g) * 100, 1)
+                    if cache_g > 0:
+                        mem_desc = f"{usd_g}G + {cache_g}G快取 / {tot_g}G"
+                    else:
+                        mem_desc = f"{usd_g}G / {tot_g}G"
     except Exception as e:
         print("MP CPU/Mem 解析異常:", e)
 
+    # 4. DP CPU (資料平面)
     dp_cpu = 0.0
     try:
         dp_root = run_pa_command("<show><running><resource-monitor><second><last>1</last></second></resource-monitor></running></show>")
@@ -358,9 +384,9 @@ def fetch_pa_health_data():
     except Exception as e:
         print("DP CPU 解析異常:", e)
 
-    # 取得 SSD 容量
+    # 5. SSD 各分區空間解析
     disk_info = fetch_pa_disk_space()
-    
+
     return {
         'hostname': hostname,
         'model': model,
@@ -373,11 +399,11 @@ def fetch_pa_health_data():
         'active_sessions': active_sessions,
         'max_sessions': max_sessions,
         'session_usage_pct': session_usage_pct,
-        'disk_usage_pct': disk_info['percent'],  # 👈 新增 SSD 百分比
-        'disk_desc': disk_info['desc'],          # 👈 新增 SSD 描述 (31G / 112G)
-        'disk_partitions': disk_info['all_partitions'] # 👈 新增這行：回傳所有分區給前端
+        'disk_usage_pct': disk_info['percent'],
+        'disk_desc': disk_info['desc'],
+        'disk_partitions': disk_info['all_partitions']
     }
-
+    
 def log_system_health_job():
     try:
         data = fetch_pa_health_data()
