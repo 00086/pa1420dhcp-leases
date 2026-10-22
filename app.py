@@ -14,6 +14,8 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, render_template, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
+import apscheduler.triggers.cron
+import apscheduler.triggers.interval
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
